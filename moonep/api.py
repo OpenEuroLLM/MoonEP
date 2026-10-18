@@ -97,6 +97,21 @@ def _validate_rank_strided_pool(pool: torch.Tensor) -> int:
     return rank_stride
 
 
+def _use_multicast() -> bool:
+    """NVLink multicast (NVSwitch) for the plan broadcast, else per-rank unicast stores.
+
+    ``MOONEP_MULTICAST``: ``auto`` (default: when the device supports it), ``1``, ``0``.
+    """
+    from .buffer import nvl_multicast_supported
+
+    mode = os.environ.get("MOONEP_MULTICAST", "auto").lower()
+    if mode in ("0", "false", "off"):
+        return False
+    if mode in ("1", "true", "on"):
+        return True
+    return bool(nvl_multicast_supported())
+
+
 def _num_sms_dedup_from_env(max_sms: int) -> int:
     """Resolve the local epilogue/prologue SM count.
 
@@ -325,7 +340,8 @@ def _create_context(
 
     # Chunk size must satisfy both VMM mapping and multicast binding.
     gran = get_vmm_granularity()
-    mc_gran = get_multicast_granularity(R)
+    use_mc = _use_multicast()
+    mc_gran = get_multicast_granularity(R) if use_mc else 1
     chunk_align_bytes = max(gran, mc_gran)
     meta_chunk_bytes = meta_chunk_logical * 4
     meta_chunk_padded = _align_up(meta_chunk_bytes, chunk_align_bytes) // 4
@@ -350,9 +366,15 @@ def _create_context(
     # Allocate NVLink shared buffers
     # ================================================================
     hidden_buf = create_nvl_dist_tensor([NvS_padded, H], torch.bfloat16, rank, R, group=group)
-    meta_buf, meta_mc = create_nvl_dist_multicast_tensor(
-        [meta_chunk_padded], torch.int32, rank, R, group=group,
-    )
+    if use_mc:
+        meta_buf, meta_mc = create_nvl_dist_multicast_tensor(
+            [meta_chunk_padded], torch.int32, rank, R, group=group,
+        )
+    else:
+        meta_buf = create_nvl_dist_tensor(
+            [meta_chunk_padded], torch.int32, rank, R, group=group,
+        )
+        meta_mc = meta_buf  # unused: planning stores to every rank's chunk instead
 
     # Zero the barrier region on all ranks
     for r in range(R):
@@ -398,6 +420,7 @@ def _create_context(
         'hidden_buf': hidden_buf,
         'meta_buf': meta_buf,
         'meta_mc': meta_mc,
+        'use_multicast': use_mc,
         # Meta layout
         'meta_chunk_padded': meta_chunk_padded,
         'WEIGHTS_OFF': WEIGHTS_OFF,

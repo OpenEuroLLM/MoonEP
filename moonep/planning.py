@@ -328,7 +328,8 @@ def _pd_issue_g2s(meta, smem_stage, src_begin, logical_count, mbar):
 class PlanningKernel:
     def __init__(self, R, E, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                  TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
-                 token_padding, num_sms):
+                 token_padding, num_sms, use_mc=True):
+        self.use_mc = use_mc
         self.R, self.E, self.S, self.K = R, E, S, K
         self.N = self.S * self.K
         self.NvS_capacity, self.NvS, self.num_vblocks = NvS_capacity, NvS, num_vblocks
@@ -918,8 +919,16 @@ class PlanningKernel:
             for i in cutlass.range(pid * num_threads + tid, nvec, num_sms * num_threads):
                 a0 = meta[PB + i * 4 + 0]; a1 = meta[PB + i * 4 + 1]
                 a2 = meta[PB + i * 4 + 2]; a3 = meta[PB + i * 4 + 3]
-                addr = (mc.iterator + (PLAN_OFF + i * 4)).toint()
-                multimem_st_v4(addr.ir_value(), a0, a1, a2, a3)
+                if cutlass.const_expr(self.use_mc):
+                    addr = (mc.iterator + (PLAN_OFF + i * 4)).toint()
+                    multimem_st_v4(addr.ir_value(), a0, a1, a2, a3)
+                else:
+                    # no NVLink multicast (no NVSwitch, e.g. 4-GPU H100 boards): one
+                    # unicast store into every rank's chunk; the cross-rank barrier
+                    # that follows publishes them as it does for copy_v4_remote
+                    for r in cutlass.range_constexpr(R):
+                        addr = (meta.iterator + (r * ms + PLAN_OFF + i * 4)).toint()
+                        st_global_v4_s32(addr.ir_value(), a0, a1, a2, a3)
         order = cute.make_tensor(meta.iterator + (rank * ms + ORDER_OFF), cute.make_layout((N,)))
         if cutlass.const_expr(R > 1):
             if rank != 0:
@@ -1106,10 +1115,10 @@ class PlanningKernel:
 @functools.lru_cache(maxsize=None)
 def _get_compiled(R, E, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                   TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
-                  token_padding, num_sms):
+                  token_padding, num_sms, use_mc=True):
     k = PlanningKernel(R, E, S, K, NvS_capacity, NvS, num_vblocks, meta_stride,
                        TPE_OFF, PLAN_OFF, BARRIER_OFF, TOPK0_OFF, ORDER_OFF, ORDER0_OFF,
-                       token_padding, num_sms)
+                       token_padding, num_sms, use_mc)
     i32 = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
     return cute.compile(k, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32,
                         i32, i32, i32, i32, Int32(0), cuda.CUstream(0))
@@ -1134,6 +1143,7 @@ def _launch_planning_kernel(ctx, topk, tpe, dst, cu_seqlens,
         int(ctx['ORDER0_OFF']),
         int(ctx['token_padding']),
         int(ctx['num_sms']),
+        bool(ctx.get('use_multicast', True)),
     )
 
     def p16(t):  # large buffers 16B aligned -> allows coalesced/vectorized access

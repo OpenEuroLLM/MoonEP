@@ -16,6 +16,8 @@ Note: cp.async.bulk is a single-thread instruction; callers must wrap the
 inline asm in ``if cute.arch.lane_idx() == 0:``.
 """
 
+import os
+
 import cutlass
 from cutlass import Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
@@ -34,7 +36,12 @@ GRID_SYNC_TAG = 0x80000000
 WARP_SYNC_TAG = 0x80000000
 
 # spin-wait timeout. Fail-fast on timeout to avoid further polluting the barrier state.
-BARRIER_TIMEOUT_CYCLES = 100 * 2_000_000_000
+# MOONEP_BARRIER_TIMEOUT_S (default 600, like a 10-minute NCCL timeout): a peer can be held up
+# legitimately by work outside MoonEP -- e.g. a blocking collective over another group (a
+# sharded Engram lookup over data-parallel ranks on other nodes) on the first step, when the
+# nodes still compile kernels at different speeds. 100 s trapped such runs.
+BARRIER_TIMEOUT_S = int(os.environ.get("MOONEP_BARRIER_TIMEOUT_S", "600"))
+BARRIER_TIMEOUT_CYCLES = BARRIER_TIMEOUT_S * 2_000_000_000
 
 
 @dsl_user_op
@@ -334,7 +341,7 @@ def cross_rank_barrier(
                 done = cur == target
                 if (clock64() - start) >= Int64(BARRIER_TIMEOUT_CYCLES):
                     cute.printf(
-                        "MoonEP cross_rank_barrier timeout (100s), trapping: "
+                        "MoonEP cross_rank_barrier timeout (MOONEP_BARRIER_TIMEOUT_S), trapping: "
                         "rank=%d barrier_off=%d phase=%d sign=%d signal=%d target=%d\n",
                         rank, barrier_off, phase, sign, cur, target,
                     )
